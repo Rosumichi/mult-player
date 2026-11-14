@@ -32,24 +32,31 @@ jobs:
           cp -r /tmp/android_tpl/android "$GITHUB_WORKSPACE/android"
           cd "$GITHUB_WORKSPACE"
           sed -i 's|<application|<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' android/app/build.gradle.kts
+          fi
+          if [ -f android/app/build.gradle ]; then
+            sed -i 's/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 36/g' android/app/build.gradle
+            sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' android/app/build.gradle
+          fi
           if [ -f android/build.gradle.kts ]; then
             cat << 'EOF' >> android/build.gradle.kts
           subprojects {
               plugins.withId("com.android.library") {
                   extensions.configure<com.android.build.gradle.LibraryExtension> {
+                      compileSdk = 36
                       if (namespace.isNullOrEmpty()) {
                           namespace = group.toString().ifEmpty { "com.multplayer.${project.name.replace('-', '_')}" }
                       }
                   }
               }
-          }
-          EOF
-          elif [ -f android/build.gradle ]; then
-            cat << 'EOF' >> android/build.gradle
-          subprojects {
-              plugins.withId("com.android.library") {
-                  if (project.android.namespace == null || project.android.namespace.isEmpty()) {
-                      project.android.namespace = project.group ? project.group.toString() : "com.multplayer.${project.name.replace('-', '_')}"
+              if (!project.state.executed) {
+                  afterEvaluate {
+                      if (plugins.hasPlugin("com.android.library")) {
+                          extensions.configure<com.android.build.gradle.LibraryExtension> {
+                              compileSdk = 36
+                          }
+                      }
                   }
               }
           }
@@ -59,10 +66,16 @@ jobs:
       - name: Загрузка библиотек и сборка APK
         run: |
           flutter pub get
-          for f in /home/runner/.pub-cache/hosted/pub.dev/video_thumbnail-*/android/build.gradle; do
+          for f in /home/runner/.pub-cache/hosted/pub.dev/*/android/build.gradle*; do
             if [ -f "$f" ]; then
               sed -i 's/jcenter()/mavenCentral()/g' "$f"
-              sed -i 's/compileSdkVersion [0-9]\+/compileSdkVersion 35/g' "$f"
+              sed -E -i 's/compileSdkVersion[[:space:]]+[0-9]+/compileSdkVersion 36/g' "$f"
+              sed -E -i 's/compileSdk[[:space:]]+[0-9]+/compileSdk 36/g' "$f"
+              sed -E -i 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 36/g' "$f"
+            fi
+          done
+          for f in /home/runner/.pub-cache/hosted/pub.dev/video_thumbnail-*/android/build.gradle; do
+            if [ -f "$f" ]; then
               grep -q "namespace" "$f" || sed -i 's/android {/android {\n    namespace "xyz.justsoft.video_thumbnail"/' "$f"
             fi
           done
