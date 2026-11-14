@@ -59,6 +59,13 @@ jobs:
       - name: Загрузка библиотек и сборка APK
         run: |
           flutter pub get
+          for f in /home/runner/.pub-cache/hosted/pub.dev/video_thumbnail-*/android/build.gradle; do
+            if [ -f "$f" ]; then
+              sed -i 's/jcenter()/mavenCentral()/g' "$f"
+              sed -i 's/compileSdkVersion [0-9]\+/compileSdkVersion 35/g' "$f"
+              grep -q "namespace" "$f" || sed -i 's/android {/android {\n    namespace "xyz.justsoft.video_thumbnail"/' "$f"
+            fi
+          done
           flutter build apk --release
 
       - name: Сохранение готового APK
