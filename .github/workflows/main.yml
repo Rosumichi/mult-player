@@ -35,12 +35,10 @@ jobs:
           if [ -f android/build.gradle.kts ]; then
             cat << 'EOF' >> android/build.gradle.kts
           subprojects {
-              afterEvaluate {
-                  if (plugins.hasPlugin("com.android.library")) {
-                      extensions.configure<com.android.build.gradle.LibraryExtension> {
-                          if (namespace == null) {
-                              namespace = group.toString()
-                          }
+              plugins.withId("com.android.library") {
+                  extensions.configure<com.android.build.gradle.LibraryExtension> {
+                      if (namespace.isNullOrEmpty()) {
+                          namespace = group.toString().ifEmpty { "com.multplayer.${project.name.replace('-', '_')}" }
                       }
                   }
               }
@@ -49,9 +47,9 @@ jobs:
           elif [ -f android/build.gradle ]; then
             cat << 'EOF' >> android/build.gradle
           subprojects {
-              afterEvaluate { project ->
-                  if (project.hasProperty('android') && project.android.namespace == null) {
-                      project.android.namespace = project.group
+              plugins.withId("com.android.library") {
+                  if (project.android.namespace == null || project.android.namespace.isEmpty()) {
+                      project.android.namespace = project.group ? project.group.toString() : "com.multplayer.${project.name.replace('-', '_')}"
                   }
               }
           }
