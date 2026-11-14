@@ -140,7 +140,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final status = await Permission.manageExternalStorage.request();
     if (status.isGranted) return true;
     final mediaVideo = await Permission.videos.request();
-    final mediaImages = await Permission.images.request();
+    final mediaImages = await Permission.photos.request();
     final storage = await Permission.storage.request();
     return mediaVideo.isGranted || mediaImages.isGranted || storage.isGranted;
   }
