@@ -644,7 +644,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 ? Image.file(lw.group.coverFile!, fit: BoxFit.cover)
                                 : Container(
                                     color: const Color(0xFF222631),
-                                    child: const Icon(Icons.History, color: Colors.white54),
+                                    child: const Icon(Icons.history, color: Colors.white54),
                                   ),
                       ),
                       const SizedBox(width: 12),
