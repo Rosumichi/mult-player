@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
@@ -13,6 +14,28 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MultPlayerApp());
+}
+
+/// Общий кэш превьюшек для всех экранов и шторки в плеере
+final Map<String, Uint8List?> globalThumbCache = {};
+
+Future<Uint8List?> getGlobalThumbnail(String videoPath) async {
+  if (globalThumbCache.containsKey(videoPath)) {
+    return globalThumbCache[videoPath];
+  }
+  try {
+    final bytes = await VideoThumbnail.thumbnailData(
+      video: videoPath,
+      imageFormat: ImageFormat.JPEG,
+      maxWidth: 320,
+      quality: 75,
+    );
+    globalThumbCache[videoPath] = bytes;
+    return bytes;
+  } catch (_) {
+    globalThumbCache[videoPath] = null;
+    return null;
+  }
 }
 
 class MultPlayerApp extends StatelessWidget {
@@ -115,13 +138,10 @@ int naturalCompare(String a, String b) {
   return matchesA.length.compareTo(matchesB.length);
 }
 
-/// Очищает название от лишних пробелов и номеров серий на конце для точной группировки
 String normalizeGroupKey(String rawTitle) {
   var s = rawTitle.toLowerCase();
-  // Заменяем любые последовательности пробелов, точек, подчеркиваний и дефисов на один пробел
   s = s.replaceAll(RegExp(r'[\s\u00A0._\-–—]+'), ' ').trim();
 
-  // Убираем на конце обозначения серий, частей и скобок с цифрами: "1", "ep 2", "(3)", "часть 1" и т.д.
   final trailingEpPattern = RegExp(
     r'(?:\s*(?:\(\d+\)|\[\d+\]|#\d+)|\s+(?:ep|episode|ova|part|ч|часть|ser|серия|s\d+e\d+|s\d+|e\d+|v\d+)?\s*\d+)+$',
     caseSensitive: false,
@@ -133,7 +153,6 @@ String normalizeGroupKey(String rawTitle) {
   return s;
 }
 
-/// Красивое отображаемое имя мульта без номера серии на конце
 String cleanDisplayTitle(String rawTitle) {
   var s = rawTitle.replaceAll(RegExp(r'[\s\u00A0]+'), ' ').trim();
   final trailingEpPattern = RegExp(
@@ -152,6 +171,8 @@ class LibraryScreen extends StatefulWidget {
 }
 
 class _LibraryScreenState extends State<LibraryScreen> {
+  final Random _rng = Random();
+
   String? _pinnedPath;
   List<CartoonGroup> _groups = [];
   bool _loading = false;
@@ -165,6 +186,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _startupBannerShownOnce = false;
   Uint8List? _lastWatchedThumb;
 
+  // Настройки и память рандома
+  Set<String> _usedRandomKeys = {};
+  bool _randomInstantMode = false; // false = Карточка выбора, true = Сразу включать
+
   @override
   void initState() {
     super.initState();
@@ -176,11 +201,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final savedPath = prefs.getString('pinned_folder_path');
     final savedCols = prefs.getInt('grid_columns') ?? 2;
     final savedContain = prefs.getBool('contain_cover') ?? false;
+    final savedUsed = prefs.getStringList('random_used_keys') ?? [];
+    final savedInstant = prefs.getBool('random_instant_mode') ?? false;
+
     setState(() {
       _pinnedPath = savedPath;
       _gridColumns = savedCols;
       _containCover = savedContain;
+      _usedRandomKeys = savedUsed.toSet();
+      _randomInstantMode = savedInstant;
     });
+
     if (savedPath != null && savedPath.isNotEmpty) {
       await _scanDirectory(savedPath, isInitialLoad: true);
     }
@@ -280,11 +311,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
         String? matchedKey;
 
-        // 1. Точное совпадение по нормализованному ключу (без номеров серий и лишних пробелов)
         if (grouped.containsKey(normalizedVideoKey)) {
           matchedKey = normalizedVideoKey;
         } else {
-          // 2. Проверка по префиксу обложки
           for (final coverKey in sortedCoverKeys) {
             if (rawCleanLower == coverKey ||
                 normalizedVideoKey == coverKey ||
@@ -296,7 +325,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
           }
         }
 
-        // 3. Если обложки нет — группируем серии друг с другом по единому нормализованному ключу
         if (matchedKey == null) {
           final displayTitle = cleanDisplayTitle(rawBase);
           grouped.putIfAbsent(
@@ -388,16 +416,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     final posMs = prefs.getInt('pos_$lastVideoPath') ?? 0;
     final durMs = prefs.getInt('dur_$lastVideoPath') ?? 0;
-
-    Uint8List? thumb;
-    try {
-      thumb = await VideoThumbnail.thumbnailData(
-        video: lastVideoPath,
-        imageFormat: ImageFormat.JPEG,
-        maxWidth: 280,
-        quality: 75,
-      );
-    } catch (_) {}
+    final thumb = await getGlobalThumbnail(lastVideoPath);
 
     if (mounted) {
       setState(() {
@@ -427,14 +446,325 @@ class _LibraryScreenState extends State<LibraryScreen> {
       context,
       MaterialPageRoute(
         builder: (_) => VideoPlayerScreen(
-          cartoonTitle: lw.group.title,
-          episodes: lw.group.episodes,
+          group: lw.group,
           initialIndex: lw.episodeIndex,
           initialPosition: startAt,
+          openedFromGroup: false,
         ),
       ),
     );
     await _refreshLastWatched();
+  }
+
+  // ==================== ЛОГИКА РАНДОМА ====================
+
+  List<CartoonGroup> get _playableGroups =>
+      _groups.where((g) => g.episodes.isNotEmpty).toList();
+
+  List<CartoonGroup> get _remainingRandomGroups =>
+      _playableGroups.where((g) => !_usedRandomKeys.contains(g.key)).toList();
+
+  Future<void> _saveRandomState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('random_used_keys', _usedRandomKeys.toList());
+    await prefs.setBool('random_instant_mode', _randomInstantMode);
+  }
+
+  Future<void> _resetRandomPool({bool showMessage = true}) async {
+    setState(() {
+      _usedRandomKeys.clear();
+    });
+    await _saveRandomState();
+    if (showMessage && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Счётчик рандома сброшен! Доступно мультов: ${_playableGroups.length}'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<({CartoonGroup group, int episodeIndex})?> _drawNextRandom() async {
+    final playable = _playableGroups;
+    if (playable.isEmpty) return null;
+
+    final available = _remainingRandomGroups;
+    if (available.isEmpty) {
+      return null;
+    }
+
+    final pickedGroup = available[_rng.nextInt(available.length)];
+    final pickedEpIndex = _rng.nextInt(pickedGroup.episodes.length);
+
+    setState(() {
+      _usedRandomKeys.add(pickedGroup.key);
+    });
+    await _saveRandomState();
+
+    return (group: pickedGroup, episodeIndex: pickedEpIndex);
+  }
+
+  Future<void> _onRandomButtonPressed() async {
+    if (_playableGroups.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Нет доступных мультфильмов с сериями')),
+      );
+      return;
+    }
+
+    if (_remainingRandomGroups.isEmpty) {
+      final reset = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF181B22),
+          title: const Text('Все мульты уже выпадали!'),
+          content: Text(
+            'Вы прокрутили все ${_playableGroups.length} мультов из списка. Сбросить счётчик и начать заново?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Отмена'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6C63FF)),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Сбросить счётчик', style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+      if (reset != true) return;
+      await _resetRandomPool(showMessage: false);
+    }
+
+    if (_randomInstantMode) {
+      // Режим 1: сразу открываем плеер со случайным мультом и серией
+      final picked = await _drawNextRandom();
+      if (picked == null || !mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => VideoPlayerScreen(
+            group: picked.group,
+            initialIndex: picked.episodeIndex,
+            initialPosition: Duration.zero,
+            openedFromGroup: false,
+          ),
+        ),
+      );
+      await _refreshLastWatched();
+    } else {
+      // Режим 2: открываем карточку рандома
+      await _openRandomCardModal();
+    }
+  }
+
+  Future<void> _openRandomCardModal() async {
+    var currentPick = await _drawNextRandom();
+    if (!mounted) return;
+
+    await showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final totalCount = _playableGroups.length;
+            final leftCount = _remainingRandomGroups.length;
+            final group = currentPick?.group;
+            final epIdx = currentPick?.episodeIndex ?? 0;
+            final ep = (group != null && group.episodes.isNotEmpty)
+                ? group.episodes[epIdx]
+                : null;
+
+            return Dialog(
+              backgroundColor: const Color(0xFF181B22),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+              clipBehavior: Clip.antiAlias,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // Шапка карточки с крестиком и счётчиком
+                    Row(
+                      children: [
+                        const Icon(Icons.casino, color: Color(0xFF00D2FF), size: 22),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Случайный мульт • Осталось: $leftCount из $totalCount',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
+                    if (group == null)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 24),
+                        child: Column(
+                          children: [
+                            const Icon(Icons.check_circle_outline,
+                                size: 48, color: Color(0xFF00D2FF)),
+                            const SizedBox(height: 10),
+                            const Text(
+                              'Все мульты уже выпали!',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 6),
+                            const Text(
+                              'Нажмите «Сбросить счётчик» ниже, чтобы запустить круг заново.',
+                              style: TextStyle(fontSize: 13, color: Colors.white60),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      )
+                    else ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: SizedBox(
+                          height: 210,
+                          child: group.coverFile != null
+                              ? Image.file(group.coverFile!, fit: BoxFit.cover)
+                              : Container(
+                                  color: const Color(0xFF222631),
+                                  child: const Icon(Icons.movie,
+                                      size: 56, color: Colors.white38),
+                                ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        group.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      if (ep != null)
+                        Text(
+                          'Выпала серия ${epIdx + 1} из ${group.episodes.length}: ${ep.title}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Color(0xFF00D2FF),
+                          ),
+                        ),
+                      const SizedBox(height: 16),
+
+                      // Кнопка Смотреть
+                      ElevatedButton.icon(
+                        onPressed: () async {
+                          Navigator.pop(ctx);
+                          await Navigator.push(
+                            this.context,
+                            MaterialPageRoute(
+                              builder: (_) => VideoPlayerScreen(
+                                group: group,
+                                initialIndex: epIdx,
+                                initialPosition: Duration.zero,
+                                openedFromGroup: false,
+                              ),
+                            ),
+                          );
+                          await _refreshLastWatched();
+                        },
+                        icon: const Icon(Icons.play_arrow),
+                        label: const Text('Смотреть серию'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF6C63FF),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+
+                      // Кнопка Открыть группу мульта
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          Navigator.pop(ctx);
+                          await Navigator.push(
+                            this.context,
+                            MaterialPageRoute(
+                              builder: (_) => CartoonDetailScreen(group: group),
+                            ),
+                          );
+                          await _refreshLastWatched();
+                        },
+                        icon: const Icon(Icons.video_library, size: 18),
+                        label: const Text('Перейти к мульту (все серии)'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Colors.white24),
+                        ),
+                      ),
+                    ],
+
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _remainingRandomGroups.isEmpty
+                                ? null
+                                : () async {
+                                    final next = await _drawNextRandom();
+                                    setModalState(() {
+                                      currentPick = next;
+                                    });
+                                  },
+                            icon: const Icon(Icons.shuffle, size: 18),
+                            label: const Text('Перерандомить'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFF00D2FF),
+                              side: const BorderSide(color: Color(0xFF00D2FF)),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          tooltip: 'Сбросить счётчик рандома',
+                          onPressed: () async {
+                            await _resetRandomPool(showMessage: false);
+                            final fresh = await _drawNextRandom();
+                            setModalState(() {
+                              currentPick = fresh;
+                            });
+                          },
+                          icon: const Icon(Icons.restart_alt, color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   List<CartoonGroup> get _filteredAndSortedGroups {
@@ -596,6 +926,80 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+  Widget _buildRandomControlBar() {
+    final total = _playableGroups.length;
+    final left = _remainingRandomGroups.length;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF181B22),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: _onRandomButtonPressed,
+                icon: const Icon(Icons.casino, size: 18),
+                label: Text(
+                  'Рандом ($left из $total)',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6C63FF),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Переключатель режима: Сразу включать ИЛИ Карточка
+            InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () async {
+                setState(() => _randomInstantMode = !_randomInstantMode);
+                await _saveRandomState();
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF222631),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _randomInstantMode ? Icons.bolt : Icons.style,
+                      size: 16,
+                      color: const Color(0xFF00D2FF),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _randomInstantMode ? 'Сразу' : 'Карточка',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Сбросить счётчик рандома',
+              icon: const Icon(Icons.restart_alt, size: 20, color: Colors.white70),
+              onPressed: () => _resetRandomPool(showMessage: true),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildLastWatchedTopSection(LastWatchedInfo lw) {
     final progress = lw.durationMs > 0
         ? (lw.positionMs / lw.durationMs).clamp(0.0, 1.0)
@@ -725,6 +1129,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
         title: const Text('МультПлеер', style: TextStyle(fontWeight: FontWeight.bold)),
         actions: [
           IconButton(
+            tooltip: 'Случайный мульт',
+            icon: const Icon(Icons.casino),
+            onPressed: _onRandomButtonPressed,
+          ),
+          IconButton(
             tooltip: 'Масштаб картинок',
             icon: const Icon(Icons.zoom_in),
             onPressed: _openScaleSheet,
@@ -778,13 +1187,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ),
             ),
 
-          // Всплывающее сверху окошко при входе (можно закрыть на крестик или смахнуть свайпом)
           if (_showStartupBanner && _lastWatched != null)
             _buildStartupFloatingBanner(_lastWatched!),
 
-          if (_groups.isNotEmpty)
+          if (_groups.isNotEmpty) ...[
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 2),
               child: TextField(
                 decoration: InputDecoration(
                   hintText: 'Поиск мультфильма...',
@@ -800,6 +1208,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onChanged: (v) => setState(() => _searchQuery = v),
               ),
             ),
+            _buildRandomControlBar(),
+          ],
 
           Expanded(
             child: _loading
@@ -969,10 +1379,18 @@ class CartoonDetailScreen extends StatefulWidget {
 }
 
 class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
-  final Map<String, Uint8List?> _thumbCache = {};
   Map<String, int> _savedPositions = {};
   Map<String, int> _savedDurations = {};
   double _previewScale = 1.0;
+
+  // Состояние превью-проигрывателя обрывков
+  VideoPlayerController? _previewController;
+  Timer? _snippetTimer;
+  String? _previewingEpisodePath;
+  int _currentSnippetIndex = 0;
+  double _dragDistanceX = 0.0;
+
+  static const List<double> _snippetFractions = [0.10, 0.25, 0.40, 0.55, 0.70, 0.85];
 
   @override
   void initState() {
@@ -996,20 +1414,62 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
     }
   }
 
-  Future<Uint8List?> _getThumbnail(String videoPath) async {
-    if (_thumbCache.containsKey(videoPath)) return _thumbCache[videoPath];
+  Future<void> _stopSnippetPreview() async {
+    _snippetTimer?.cancel();
+    _snippetTimer = null;
+    final old = _previewController;
+    _previewController = null;
+    _previewingEpisodePath = null;
+    if (mounted) setState(() {});
+    await old?.dispose();
+  }
+
+  Future<void> _startSnippetPreview(EpisodeItem ep) async {
+    await _stopSnippetPreview();
+    if (!mounted) return;
+
+    setState(() {
+      _previewingEpisodePath = ep.file.path;
+      _currentSnippetIndex = 0;
+    });
+
     try {
-      final bytes = await VideoThumbnail.thumbnailData(
-        video: videoPath,
-        imageFormat: ImageFormat.JPEG,
-        maxWidth: 320,
-        quality: 75,
-      );
-      _thumbCache[videoPath] = bytes;
-      return bytes;
+      final controller = VideoPlayerController.file(ep.file);
+      await controller.initialize();
+      if (!mounted || _previewingEpisodePath != ep.file.path) {
+        await controller.dispose();
+        return;
+      }
+      await controller.setVolume(0.0);
+
+      final totalMs = controller.value.duration.inMilliseconds;
+      if (totalMs > 1000) {
+        final firstTarget = (totalMs * _snippetFractions[0]).round();
+        await controller.seekTo(Duration(milliseconds: firstTarget));
+      }
+      await controller.play();
+
+      setState(() {
+        _previewController = controller;
+      });
+
+      _snippetTimer = Timer.periodic(const Duration(milliseconds: 2400), (_) async {
+        final c = _previewController;
+        if (c == null || !c.value.isInitialized || !mounted) return;
+        final nextIdx = (_currentSnippetIndex + 1) % _snippetFractions.length;
+        final dur = c.value.duration.inMilliseconds;
+        if (dur > 1000) {
+          final targetMs = (dur * _snippetFractions[nextIdx]).round();
+          await c.seekTo(Duration(milliseconds: targetMs));
+        }
+        if (mounted) {
+          setState(() {
+            _currentSnippetIndex = nextIdx;
+          });
+        }
+      });
     } catch (_) {
-      _thumbCache[videoPath] = null;
-      return null;
+      await _stopSnippetPreview();
     }
   }
 
@@ -1034,6 +1494,9 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
   }
 
   Future<void> _onEpisodeTap(int index) async {
+    await _stopSnippetPreview();
+    if (!mounted) return;
+
     final ep = widget.group.episodes[index];
     final savedMs = _savedPositions[ep.file.path] ?? 0;
     final durMs = _savedDurations[ep.file.path] ?? 0;
@@ -1075,14 +1538,21 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
       context,
       MaterialPageRoute(
         builder: (_) => VideoPlayerScreen(
-          cartoonTitle: widget.group.title,
-          episodes: widget.group.episodes,
+          group: widget.group,
           initialIndex: index,
           initialPosition: startAt,
+          openedFromGroup: true,
         ),
       ),
     );
     await _loadHistory();
+  }
+
+  @override
+  void dispose() {
+    _snippetTimer?.cancel();
+    _previewController?.dispose();
+    super.dispose();
   }
 
   @override
@@ -1140,9 +1610,21 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
               ),
             ),
           const SizedBox(height: 16),
-          Text(
-            'Серии (${widget.group.episodes.length})',
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          Row(
+            children: [
+              Text(
+                'Серии (${widget.group.episodes.length})',
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text(
+                  'Свайп вправо по серии → превью-обрывки',
+                  textAlign: TextAlign.right,
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 10),
           ...List.generate(widget.group.episodes.length, (index) {
@@ -1150,78 +1632,160 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
             final posMs = _savedPositions[ep.file.path] ?? 0;
             final durMs = _savedDurations[ep.file.path] ?? 0;
             final progress = durMs > 0 ? (posMs / durMs).clamp(0.0, 1.0) : 0.0;
+            final isPreviewingThis = _previewingEpisodePath == ep.file.path;
 
-            return Card(
-              color: const Color(0xFF181B22),
-              margin: const EdgeInsets.only(bottom: 10),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                onTap: () => _onEpisodeTap(index),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        SizedBox(
-                          width: 130 * _previewScale,
-                          height: 76 * _previewScale,
-                          child: FutureBuilder<Uint8List?>(
-                            future: _getThumbnail(ep.file.path),
-                            builder: (context, snap) {
-                              if (snap.hasData && snap.data != null) {
-                                return Image.memory(snap.data!, fit: BoxFit.cover);
-                              }
-                              return Container(
-                                color: const Color(0xFF222631),
-                                child: const Icon(Icons.play_circle_outline, size: 32),
-                              );
-                            },
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+            return GestureDetector(
+              onHorizontalDragStart: (_) {
+                _dragDistanceX = 0.0;
+              },
+              onHorizontalDragUpdate: (details) {
+                _dragDistanceX += details.delta.dx;
+              },
+              onHorizontalDragEnd: (_) {
+                // Если приложили палец, провели вправо и убрали палец — включаем обрывки на превьюшке
+                if (_dragDistanceX > 35) {
+                  _startSnippetPreview(ep);
+                } else if (_dragDistanceX < -35 && isPreviewingThis) {
+                  _stopSnippetPreview();
+                }
+                _dragDistanceX = 0.0;
+              },
+              child: Card(
+                color: const Color(0xFF181B22),
+                margin: const EdgeInsets.only(bottom: 10),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: isPreviewingThis
+                      ? const BorderSide(color: Color(0xFF00D2FF), width: 1.5)
+                      : BorderSide.none,
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  onTap: () => _onEpisodeTap(index),
+                  child: Column(
+                    children: [
+                      Row(
+                        children: [
+                          SizedBox(
+                            width: 140 * _previewScale,
+                            height: 82 * _previewScale,
+                            child: Stack(
+                              fit: StackFit.expand,
                               children: [
-                                Text(
-                                  ep.title,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 15,
+                                if (isPreviewingThis &&
+                                    _previewController != null &&
+                                    _previewController!.value.isInitialized)
+                                  FittedBox(
+                                    fit: BoxFit.cover,
+                                    clipBehavior: Clip.hardEdge,
+                                    child: SizedBox(
+                                      width: _previewController!.value.size.width,
+                                      height: _previewController!.value.size.height,
+                                      child: VideoPlayer(_previewController!),
+                                    ),
+                                  )
+                                else
+                                  FutureBuilder<Uint8List?>(
+                                    future: getGlobalThumbnail(ep.file.path),
+                                    builder: (context, snap) {
+                                      if (snap.hasData && snap.data != null) {
+                                        return Image.memory(snap.data!, fit: BoxFit.cover);
+                                      }
+                                      return Container(
+                                        color: const Color(0xFF222631),
+                                        child: const Icon(Icons.play_circle_outline, size: 32),
+                                      );
+                                    },
                                   ),
-                                ),
-                                const SizedBox(height: 6),
-                                if (posMs > 3000)
-                                  Text(
-                                    'Просмотрено до ${formatDuration(Duration(milliseconds: posMs))}',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      color: Color(0xFF00D2FF),
+
+                                if (isPreviewingThis)
+                                  Positioned(
+                                    top: 4,
+                                    left: 4,
+                                    right: 4,
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: Colors.black87,
+                                            borderRadius: BorderRadius.circular(6),
+                                          ),
+                                          child: Text(
+                                            'Обрывок ${_currentSnippetIndex + 1}/${_snippetFractions.length}',
+                                            style: const TextStyle(
+                                              fontSize: 10,
+                                              color: Color(0xFF00D2FF),
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        GestureDetector(
+                                          onTap: _stopSnippetPreview,
+                                          child: Container(
+                                            padding: const EdgeInsets.all(2),
+                                            decoration: const BoxDecoration(
+                                              color: Colors.black87,
+                                              shape: BoxShape.circle,
+                                            ),
+                                            child: const Icon(Icons.close,
+                                                size: 14, color: Colors.white),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
                               ],
                             ),
                           ),
-                        ),
-                        const Padding(
-                          padding: EdgeInsets.only(right: 12),
-                          child: Icon(Icons.play_arrow_rounded,
-                              size: 30, color: Color(0xFF6C63FF)),
-                        ),
-                      ],
-                    ),
-                    if (progress > 0)
-                      LinearProgressIndicator(
-                        value: progress,
-                        minHeight: 3,
-                        backgroundColor: Colors.white12,
-                        color: const Color(0xFF6C63FF),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    ep.title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  if (posMs > 3000)
+                                    Text(
+                                      'Просмотрено до ${formatDuration(Duration(milliseconds: posMs))}',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        color: Color(0xFF00D2FF),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const Padding(
+                            padding: EdgeInsets.only(right: 12),
+                            child: Icon(Icons.play_arrow_rounded,
+                                size: 30, color: Color(0xFF6C63FF)),
+                          ),
+                        ],
                       ),
-                  ],
+                      if (progress > 0)
+                        LinearProgressIndicator(
+                          value: progress,
+                          minHeight: 3,
+                          backgroundColor: Colors.white12,
+                          color: const Color(0xFF6C63FF),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             );
@@ -1233,17 +1797,17 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
 }
 
 class VideoPlayerScreen extends StatefulWidget {
-  final String cartoonTitle;
-  final List<EpisodeItem> episodes;
+  final CartoonGroup group;
   final int initialIndex;
   final Duration initialPosition;
+  final bool openedFromGroup;
 
   const VideoPlayerScreen({
     super.key,
-    required this.cartoonTitle,
-    required this.episodes,
+    required this.group,
     required this.initialIndex,
     required this.initialPosition,
+    required this.openedFromGroup,
   });
 
   @override
@@ -1265,6 +1829,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   String? _seekBadgeText;
   Timer? _badgeTimer;
 
+  List<EpisodeItem> get _episodes => widget.group.episodes;
+
   @override
   void initState() {
     super.initState();
@@ -1282,7 +1848,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
     await oldController?.dispose();
 
-    final ep = widget.episodes[index];
+    final ep = _episodes[index];
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('last_watched_path', ep.file.path);
 
@@ -1310,7 +1876,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   Future<void> _saveCurrentProgress() async {
     final c = _controller;
     if (c == null || !c.value.isInitialized) return;
-    final ep = widget.episodes[_currentIndex];
+    final ep = _episodes[_currentIndex];
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('last_watched_path', ep.file.path);
     await prefs.setInt('pos_${ep.file.path}', c.value.position.inMilliseconds);
@@ -1360,6 +1926,208 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
   }
 
+  Future<void> _goToCartoonGroup() async {
+    await _saveCurrentProgress();
+    if (!mounted) return;
+    if (widget.openedFromGroup) {
+      // Если плеер открыт из группы мульта — просто возвращаемся в неё
+      Navigator.pop(context);
+    } else {
+      // Если плеер открыт с главного экрана ("Продолжить" или "Рандом") — заменяем плеер на экран группы мульта
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CartoonDetailScreen(group: widget.group),
+        ),
+      );
+    }
+  }
+
+  Future<void> _openEpisodesAndGroupSheet() async {
+    _hideTimer?.cancel();
+    final prefs = await SharedPreferences.getInstance();
+
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF181B22),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.65,
+          minChildSize: 0.4,
+          maxChildSize: 0.9,
+          builder: (context, scrollController) {
+            return Column(
+              children: [
+                // Верхняя шапка шторки с кнопкой "Перейти к мульту"
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              widget.group.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              'Всего серий: ${_episodes.length}',
+                              style: const TextStyle(fontSize: 12, color: Colors.white60),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _goToCartoonGroup();
+                        },
+                        icon: const Icon(Icons.video_library, size: 18),
+                        label: const Text('Перейти к мульту'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF6C63FF),
+                          foregroundColor: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1, color: Colors.white12),
+
+                // Список всех серий с превьюшками
+                Expanded(
+                  child: ListView.builder(
+                    controller: scrollController,
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _episodes.length,
+                    itemBuilder: (context, index) {
+                      final ep = _episodes[index];
+                      final isCurrent = index == _currentIndex;
+                      final posMs = prefs.getInt('pos_${ep.file.path}') ?? 0;
+                      final durMs = prefs.getInt('dur_${ep.file.path}') ?? 0;
+                      final progress = durMs > 0 ? (posMs / durMs).clamp(0.0, 1.0) : 0.0;
+
+                      return Card(
+                        color: isCurrent
+                            ? const Color(0xFF282442)
+                            : const Color(0xFF14171D),
+                        margin: const EdgeInsets.only(bottom: 10),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          side: isCurrent
+                              ? const BorderSide(color: Color(0xFF6C63FF), width: 1.5)
+                              : BorderSide.none,
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: InkWell(
+                          onTap: () {
+                            Navigator.pop(ctx);
+                            if (index != _currentIndex) {
+                              _initEpisode(index);
+                            }
+                          },
+                          child: Column(
+                            children: [
+                              Row(
+                                children: [
+                                  SizedBox(
+                                    width: 120,
+                                    height: 70,
+                                    child: FutureBuilder<Uint8List?>(
+                                      future: getGlobalThumbnail(ep.file.path),
+                                      builder: (context, snap) {
+                                        if (snap.hasData && snap.data != null) {
+                                          return Image.memory(snap.data!, fit: BoxFit.cover);
+                                        }
+                                        return Container(
+                                          color: const Color(0xFF222631),
+                                          child: const Icon(Icons.play_circle_outline),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(vertical: 8),
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            ep.title,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14,
+                                              color: isCurrent
+                                                  ? const Color(0xFF00D2FF)
+                                                  : Colors.white,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            isCurrent
+                                                ? 'Сейчас играет'
+                                                : posMs > 3000
+                                                    ? 'До ${formatDuration(Duration(milliseconds: posMs))}'
+                                                    : 'Серия ${index + 1}',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                              color: Colors.white70,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.only(right: 12),
+                                    child: Icon(
+                                      isCurrent
+                                          ? Icons.equalizer
+                                          : Icons.play_arrow_rounded,
+                                      color: const Color(0xFF6C63FF),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (progress > 0)
+                                LinearProgressIndicator(
+                                  value: progress,
+                                  minHeight: 3,
+                                  backgroundColor: Colors.white12,
+                                  color: const Color(0xFF6C63FF),
+                                ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    _restartHideTimer();
+  }
+
   @override
   void dispose() {
     _saveCurrentProgress();
@@ -1379,9 +2147,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final c = _controller;
-    final ep = widget.episodes[_currentIndex];
+    final ep = _episodes[_currentIndex];
     final hasPrev = _currentIndex > 0;
-    final hasNext = _currentIndex < widget.episodes.length - 1;
+    final hasNext = _currentIndex < _episodes.length - 1;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -1432,7 +2200,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             child: Stack(
               alignment: Alignment.center,
               children: [
-                // Видео без масштабирования и зум-полосок
                 if (c != null && c.value.isInitialized)
                   Center(
                     child: AspectRatio(
@@ -1443,7 +2210,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 else
                   const CircularProgressIndicator(color: Color(0xFF6C63FF)),
 
-                // Индикатор свайп-перемотки
                 if (_isScrubbing && c != null)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -1461,7 +2227,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                     ),
                   ),
 
-                // Индикатор двойного тапа ±10 сек
                 if (_seekBadgeText != null)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
@@ -1479,7 +2244,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                     ),
                   ),
 
-                // Оверлей управления
                 if (_showControls)
                   Positioned.fill(
                     child: Container(
@@ -1488,7 +2252,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            // Верхняя панель
+                            // Верхняя панель с кнопкой "Серии / К мульту"
                             Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                               child: Row(
@@ -1507,17 +2271,31 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                           overflow: TextOverflow.ellipsis,
                                           style: const TextStyle(
                                             fontWeight: FontWeight.bold,
-                                            fontSize: 16,
+                                            fontSize: 15,
                                           ),
                                         ),
                                         Text(
-                                          '${widget.cartoonTitle} • Серия ${_currentIndex + 1} из ${widget.episodes.length}',
+                                          '${widget.group.title} • Серия ${_currentIndex + 1} из ${_episodes.length}',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
                                           style: const TextStyle(
                                             fontSize: 12,
                                             color: Colors.white70,
                                           ),
                                         ),
                                       ],
+                                    ),
+                                  ),
+                                  TextButton.icon(
+                                    onPressed: _openEpisodesAndGroupSheet,
+                                    icon: const Icon(Icons.playlist_play,
+                                        color: Color(0xFF00D2FF)),
+                                    label: const Text(
+                                      'Серии',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                      ),
                                     ),
                                   ),
                                   IconButton(
@@ -1529,7 +2307,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                               ),
                             ),
 
-                            // Центральные кнопки переключения серий внутри мульта
+                            // Центральные кнопки переключения серий
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
@@ -1572,7 +2350,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                               ],
                             ),
 
-                            // Нижняя шкала времени (без полоски масштаба)
+                            // Нижняя шкала времени
                             if (c != null && c.value.isInitialized)
                               Padding(
                                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
