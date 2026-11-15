@@ -53,16 +53,34 @@ class EpisodeItem {
 }
 
 class CartoonGroup {
+  final String key;
   final String title;
   final File? coverFile;
   final List<EpisodeItem> episodes;
   final DateTime latestDate;
 
   CartoonGroup({
+    required this.key,
     required this.title,
     required this.coverFile,
     required this.episodes,
     required this.latestDate,
+  });
+}
+
+class LastWatchedInfo {
+  final CartoonGroup group;
+  final int episodeIndex;
+  final EpisodeItem episode;
+  final int positionMs;
+  final int durationMs;
+
+  LastWatchedInfo({
+    required this.group,
+    required this.episodeIndex,
+    required this.episode,
+    required this.positionMs,
+    required this.durationMs,
   });
 }
 
@@ -97,6 +115,35 @@ int naturalCompare(String a, String b) {
   return matchesA.length.compareTo(matchesB.length);
 }
 
+/// Очищает название от лишних пробелов и номеров серий на конце для точной группировки
+String normalizeGroupKey(String rawTitle) {
+  var s = rawTitle.toLowerCase();
+  // Заменяем любые последовательности пробелов, точек, подчеркиваний и дефисов на один пробел
+  s = s.replaceAll(RegExp(r'[\s\u00A0._\-–—]+'), ' ').trim();
+
+  // Убираем на конце обозначения серий, частей и скобок с цифрами: "1", "ep 2", "(3)", "часть 1" и т.д.
+  final trailingEpPattern = RegExp(
+    r'(?:\s*(?:\(\d+\)|\[\d+\]|#\d+)|\s+(?:ep|episode|ova|part|ч|часть|ser|серия|s\d+e\d+|s\d+|e\d+|v\d+)?\s*\d+)+$',
+    caseSensitive: false,
+  );
+  final stripped = s.replaceFirst(trailingEpPattern, '').trim();
+  if (stripped.isNotEmpty) {
+    s = stripped;
+  }
+  return s;
+}
+
+/// Красивое отображаемое имя мульта без номера серии на конце
+String cleanDisplayTitle(String rawTitle) {
+  var s = rawTitle.replaceAll(RegExp(r'[\s\u00A0]+'), ' ').trim();
+  final trailingEpPattern = RegExp(
+    r'[\s._\-–—]+(?:(?:\(\d+\)|\[\d+\]|#\d+)|(?:ep|episode|ova|part|ч|часть|ser|серия|s\d+e\d+)?[\s._\-]*\d+)$',
+    caseSensitive: false,
+  );
+  final stripped = s.replaceFirst(trailingEpPattern, '').trim();
+  return stripped.isNotEmpty ? stripped : s;
+}
+
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen({super.key});
 
@@ -112,6 +159,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _containCover = false;
   SortMode _sortMode = SortMode.nameAsc;
   String _searchQuery = '';
+
+  LastWatchedInfo? _lastWatched;
+  bool _showStartupBanner = false;
+  bool _startupBannerShownOnce = false;
+  Uint8List? _lastWatchedThumb;
 
   @override
   void initState() {
@@ -130,7 +182,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _containCover = savedContain;
     });
     if (savedPath != null && savedPath.isNotEmpty) {
-      await _scanDirectory(savedPath);
+      await _scanDirectory(savedPath, isInitialLoad: true);
     }
   }
 
@@ -165,7 +217,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await _scanDirectory(selectedDir);
   }
 
-  Future<void> _scanDirectory(String path) async {
+  Future<void> _scanDirectory(String path, {bool isInitialLoad = false}) async {
     setState(() => _loading = true);
     try {
       final dir = Directory(path);
@@ -181,21 +233,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
       const imageExts = {'.jpg', '.jpeg', '.png', '.webp'};
       const videoExts = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v'};
 
-      final Map<String, ({String displayName, File file})> coversByLowerName = {};
+      final Map<String, ({String displayName, File file})> coversByKey = {};
       final List<File> videoFiles = [];
 
       for (final file in entities) {
-        final name = file.uri.pathSegments.last;
+        final name = file.path.split(Platform.pathSeparator).last;
         final dotIdx = name.lastIndexOf('.');
         if (dotIdx <= 0) continue;
         final ext = name.substring(dotIdx).toLowerCase();
-        // Убираем пробел перед расширением ("name .jpg" -> "name")
         final baseTitle = name.substring(0, dotIdx).trim();
         if (baseTitle.isEmpty) continue;
 
         if (imageExts.contains(ext)) {
-          coversByLowerName[baseTitle.toLowerCase()] = (
-            displayName: baseTitle,
+          final key = normalizeGroupKey(baseTitle);
+          coversByKey[key] = (
+            displayName: cleanDisplayTitle(baseTitle),
             file: file,
           );
         } else if (videoExts.contains(ext)) {
@@ -203,13 +255,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
 
-      // Сортируем ключи обложек от длинных к коротким для точного сопоставления
-      final sortedCoverKeys = coversByLowerName.keys.toList()
+      final sortedCoverKeys = coversByKey.keys.toList()
         ..sort((a, b) => b.length.compareTo(a.length));
 
       final Map<String, ({String title, File? cover, List<EpisodeItem> episodes})> grouped = {};
 
-      for (final entry in coversByLowerName.entries) {
+      for (final entry in coversByKey.entries) {
         grouped[entry.key] = (
           title: entry.value.displayName,
           cover: entry.value.file,
@@ -217,44 +268,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
         );
       }
 
-      final trailingEpisodeReg = RegExp(
-        r'[\s._-]+(?:ep|ser|серия|s\d+e)?\d+$',
-        caseSensitive: false,
-      );
-
       for (final video in videoFiles) {
-        final fileName = video.uri.pathSegments.last;
+        final fileName = video.path.split(Platform.pathSeparator).last;
         final dotIdx = fileName.lastIndexOf('.');
         final rawBase = fileName.substring(0, dotIdx).trim();
-        final rawLower = rawBase.toLowerCase();
+        final normalizedVideoKey = normalizeGroupKey(rawBase);
+        final rawCleanLower = rawBase
+            .toLowerCase()
+            .replaceAll(RegExp(r'[\s\u00A0._\-–—]+'), ' ')
+            .trim();
 
         String? matchedKey;
-        for (final coverKey in sortedCoverKeys) {
-          if (rawLower == coverKey) {
-            matchedKey = coverKey;
-            break;
-          }
-          if (rawLower.startsWith(coverKey)) {
-            final remainder = rawLower.substring(coverKey.length);
-            if (RegExp(r'^[\s._-]').hasMatch(remainder)) {
+
+        // 1. Точное совпадение по нормализованному ключу (без номеров серий и лишних пробелов)
+        if (grouped.containsKey(normalizedVideoKey)) {
+          matchedKey = normalizedVideoKey;
+        } else {
+          // 2. Проверка по префиксу обложки
+          for (final coverKey in sortedCoverKeys) {
+            if (rawCleanLower == coverKey ||
+                normalizedVideoKey == coverKey ||
+                rawCleanLower.startsWith('$coverKey ') ||
+                normalizedVideoKey.startsWith('$coverKey ')) {
               matchedKey = coverKey;
               break;
             }
           }
         }
 
+        // 3. Если обложки нет — группируем серии друг с другом по единому нормализованному ключу
         if (matchedKey == null) {
-          final fallbackTitle = rawBase.replaceFirst(trailingEpisodeReg, '').trim();
-          final key = (fallbackTitle.isEmpty ? rawBase : fallbackTitle).toLowerCase();
+          final displayTitle = cleanDisplayTitle(rawBase);
           grouped.putIfAbsent(
-            key,
+            normalizedVideoKey,
             () => (
-              title: fallbackTitle.isEmpty ? rawBase : fallbackTitle,
+              title: displayTitle,
               cover: null,
               episodes: [],
             ),
           );
-          matchedKey = key;
+          matchedKey = normalizedVideoKey;
         }
 
         final stat = video.statSync();
@@ -268,15 +321,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
 
       final List<CartoonGroup> result = [];
-      for (final item in grouped.values) {
+      for (final entry in grouped.entries) {
+        final item = entry.value;
         if (item.episodes.isEmpty && item.cover == null) continue;
         item.episodes.sort((a, b) => naturalCompare(a.title, b.title));
-        DateTime latest = item.cover?.statSync().modified ?? DateTime.fromMillisecondsSinceEpoch(0);
+        DateTime latest =
+            item.cover?.statSync().modified ?? DateTime.fromMillisecondsSinceEpoch(0);
         for (final ep in item.episodes) {
           if (ep.modified.isAfter(latest)) latest = ep.modified;
         }
         result.add(
           CartoonGroup(
+            key: entry.key,
             title: item.title,
             coverFile: item.cover,
             episodes: item.episodes,
@@ -289,6 +345,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
         _groups = result;
         _loading = false;
       });
+
+      await _refreshLastWatched(triggerBanner: isInitialLoad);
     } catch (e) {
       setState(() => _loading = false);
       if (mounted) {
@@ -297,6 +355,86 @@ class _LibraryScreenState extends State<LibraryScreen> {
         );
       }
     }
+  }
+
+  Future<void> _refreshLastWatched({bool triggerBanner = false}) async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastVideoPath = prefs.getString('last_watched_path');
+    if (lastVideoPath == null || _groups.isEmpty) {
+      if (mounted) setState(() => _lastWatched = null);
+      return;
+    }
+
+    CartoonGroup? foundGroup;
+    int? foundIndex;
+    EpisodeItem? foundEp;
+
+    for (final g in _groups) {
+      for (int i = 0; i < g.episodes.length; i++) {
+        if (g.episodes[i].file.path == lastVideoPath) {
+          foundGroup = g;
+          foundIndex = i;
+          foundEp = g.episodes[i];
+          break;
+        }
+      }
+      if (foundGroup != null) break;
+    }
+
+    if (foundGroup == null || foundEp == null || foundIndex == null) {
+      if (mounted) setState(() => _lastWatched = null);
+      return;
+    }
+
+    final posMs = prefs.getInt('pos_$lastVideoPath') ?? 0;
+    final durMs = prefs.getInt('dur_$lastVideoPath') ?? 0;
+
+    Uint8List? thumb;
+    try {
+      thumb = await VideoThumbnail.thumbnailData(
+        video: lastVideoPath,
+        imageFormat: ImageFormat.JPEG,
+        maxWidth: 280,
+        quality: 75,
+      );
+    } catch (_) {}
+
+    if (mounted) {
+      setState(() {
+        _lastWatchedThumb = thumb;
+        _lastWatched = LastWatchedInfo(
+          group: foundGroup!,
+          episodeIndex: foundIndex!,
+          episode: foundEp!,
+          positionMs: posMs,
+          durationMs: durMs,
+        );
+        if (triggerBanner && !_startupBannerShownOnce && posMs > 1000) {
+          _showStartupBanner = true;
+          _startupBannerShownOnce = true;
+        }
+      });
+    }
+  }
+
+  Future<void> _openLastWatched({required bool resume}) async {
+    final lw = _lastWatched;
+    if (lw == null) return;
+    setState(() => _showStartupBanner = false);
+
+    final startAt = resume ? Duration(milliseconds: lw.positionMs) : Duration.zero;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => VideoPlayerScreen(
+          cartoonTitle: lw.group.title,
+          episodes: lw.group.episodes,
+          initialIndex: lw.episodeIndex,
+          initialPosition: startAt,
+        ),
+      ),
+    );
+    await _refreshLastWatched();
   }
 
   List<CartoonGroup> get _filteredAndSortedGroups {
@@ -382,6 +520,202 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+  Widget _buildStartupFloatingBanner(LastWatchedInfo lw) {
+    final posText = formatDuration(Duration(milliseconds: lw.positionMs));
+    return Dismissible(
+      key: const ValueKey('startup_continue_banner'),
+      direction: DismissDirection.horizontal,
+      onDismissed: (_) => setState(() => _showStartupBanner = false),
+      child: Container(
+        margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+        padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFF282442), Color(0xFF1A1D26)],
+          ),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFF6C63FF).withOpacity(0.6)),
+          boxShadow: const [
+            BoxShadow(color: Colors.black54, blurRadius: 10, offset: Offset(0, 4)),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.play_circle_fill, color: Color(0xFF00D2FF), size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Вы смотрели: ${lw.episode.title}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                  ),
+                ),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  icon: const Icon(Icons.close, size: 20, color: Colors.white70),
+                  onPressed: () => setState(() => _showStartupBanner = false),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () => _openLastWatched(resume: true),
+                    icon: const Icon(Icons.play_arrow, size: 18),
+                    label: Text('Продолжить ($posText)'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF6C63FF),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                OutlinedButton(
+                  onPressed: () => _openLastWatched(resume: false),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white24),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  ),
+                  child: const Text('Начать заново'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLastWatchedTopSection(LastWatchedInfo lw) {
+    final progress = lw.durationMs > 0
+        ? (lw.positionMs / lw.durationMs).clamp(0.0, 1.0)
+        : 0.0;
+    final posText = formatDuration(Duration(milliseconds: lw.positionMs));
+    final durText = lw.durationMs > 0
+        ? formatDuration(Duration(milliseconds: lw.durationMs))
+        : '--:--';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(left: 4, bottom: 6),
+            child: Text(
+              'Последнее просмотренное',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.white70,
+              ),
+            ),
+          ),
+          InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: () => _openLastWatched(resume: true),
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFF181B22),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.white12),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 110,
+                        height: 66,
+                        child: _lastWatchedThumb != null
+                            ? Image.memory(_lastWatchedThumb!, fit: BoxFit.cover)
+                            : lw.group.coverFile != null
+                                ? Image.file(lw.group.coverFile!, fit: BoxFit.cover)
+                                : Container(
+                                    color: const Color(0xFF222631),
+                                    child: const Icon(Icons.History, color: Colors.white54),
+                                  ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                lw.group.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                lw.episode.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '$posText / $durText',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Color(0xFF00D2FF),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Начать с начала',
+                        icon: const Icon(Icons.replay, color: Colors.white60, size: 22),
+                        onPressed: () => _openLastWatched(resume: false),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.only(right: 10),
+                        child: Icon(
+                          Icons.play_circle_fill,
+                          color: Color(0xFF6C63FF),
+                          size: 32,
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (progress > 0)
+                    LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 3,
+                      backgroundColor: Colors.white12,
+                      color: const Color(0xFF6C63FF),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final items = _filteredAndSortedGroups;
@@ -443,6 +777,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 ],
               ),
             ),
+
+          // Всплывающее сверху окошко при входе (можно закрыть на крестик или смахнуть свайпом)
+          if (_showStartupBanner && _lastWatched != null)
+            _buildStartupFloatingBanner(_lastWatched!),
+
           if (_groups.isNotEmpty)
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
@@ -461,6 +800,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onChanged: (v) => setState(() => _searchQuery = v),
               ),
             ),
+
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -471,7 +811,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Icon(Icons.video_library_outlined, size: 72, color: Colors.white38),
+                              const Icon(Icons.video_library_outlined,
+                                  size: 72, color: Colors.white38),
                               const SizedBox(height: 16),
                               const Text(
                                 'Папка с мультфильмами не выбрана',
@@ -492,46 +833,63 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: const Color(0xFF6C63FF),
                                   foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 24, vertical: 14),
                                 ),
                               ),
                             ],
                           ),
                         ),
                       )
-                    : items.isEmpty
-                        ? const Center(
-                            child: Text(
-                              'В этой папке не найдено мультфильмов',
-                              style: TextStyle(color: Colors.white60),
+                    : CustomScrollView(
+                        slivers: [
+                          if (_lastWatched != null && _searchQuery.isEmpty)
+                            SliverToBoxAdapter(
+                              child: _buildLastWatchedTopSection(_lastWatched!),
                             ),
-                          )
-                        : GridView.builder(
-                            padding: const EdgeInsets.all(12),
-                            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: _gridColumns,
-                              crossAxisSpacing: 12,
-                              mainAxisSpacing: 12,
-                              childAspectRatio: _gridColumns == 1 ? 1.5 : 0.72,
+                          if (items.isEmpty)
+                            const SliverFillRemaining(
+                              child: Center(
+                                child: Text(
+                                  'В этой папке не найдено мультфильмов',
+                                  style: TextStyle(color: Colors.white60),
+                                ),
+                              ),
+                            )
+                          else
+                            SliverPadding(
+                              padding: const EdgeInsets.all(12),
+                              sliver: SliverGrid(
+                                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: _gridColumns,
+                                  crossAxisSpacing: 12,
+                                  mainAxisSpacing: 12,
+                                  childAspectRatio: _gridColumns == 1 ? 1.5 : 0.72,
+                                ),
+                                delegate: SliverChildBuilderDelegate(
+                                  (context, index) {
+                                    final group = items[index];
+                                    return _CartoonCard(
+                                      group: group,
+                                      containCover: _containCover,
+                                      onTap: () async {
+                                        await Navigator.push(
+                                          context,
+                                          MaterialPageRoute(
+                                            builder: (_) =>
+                                                CartoonDetailScreen(group: group),
+                                          ),
+                                        );
+                                        await _refreshLastWatched();
+                                      },
+                                    );
+                                  },
+                                  childCount: items.length,
+                                ),
+                              ),
                             ),
-                            itemCount: items.length,
-                            itemBuilder: (context, index) {
-                              final group = items[index];
-                              return _CartoonCard(
-                                group: group,
-                                containCover: _containCover,
-                                onTap: () async {
-                                  await Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => CartoonDetailScreen(group: group),
-                                    ),
-                                  );
-                                  setState(() {});
-                                },
-                              );
-                            },
-                          ),
+                        ],
+                      ),
           ),
         ],
       ),
@@ -851,7 +1209,8 @@ class _CartoonDetailScreenState extends State<CartoonDetailScreen> {
                         ),
                         const Padding(
                           padding: EdgeInsets.only(right: 12),
-                          child: Icon(Icons.play_arrow_rounded, size: 30, color: Color(0xFF6C63FF)),
+                          child: Icon(Icons.play_arrow_rounded,
+                              size: 30, color: Color(0xFF6C63FF)),
                         ),
                       ],
                     ),
@@ -894,20 +1253,15 @@ class VideoPlayerScreen extends StatefulWidget {
 class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   late int _currentIndex;
   VideoPlayerController? _controller;
-  final TransformationController _transformController = TransformationController();
-  double _videoScale = 1.0;
 
   bool _isLandscape = false;
   bool _showControls = true;
   Timer? _hideTimer;
   Timer? _saveTimer;
 
-  // Переменные для плавного свайпа перемотки
   bool _isScrubbing = false;
-  Duration _scrubStartPos = Duration.zero;
   Duration _scrubTargetPos = Duration.zero;
 
-  // Индикатор двойного тапа (-10с / +10с)
   String? _seekBadgeText;
   Timer? _badgeTimer;
 
@@ -929,19 +1283,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     await oldController?.dispose();
 
     final ep = widget.episodes[index];
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('last_watched_path', ep.file.path);
+
     final controller = VideoPlayerController.file(ep.file);
     await controller.initialize();
     if (startPos > Duration.zero && startPos < controller.value.duration) {
       await controller.seekTo(startPos);
     }
     await controller.play();
+    await _saveCurrentProgress();
 
     controller.addListener(() {
       if (mounted) setState(() {});
     });
 
     _saveTimer?.cancel();
-    _saveTimer = Timer.periodic(const Duration(seconds: 4), (_) => _saveCurrentProgress());
+    _saveTimer = Timer.periodic(const Duration(seconds: 3), (_) => _saveCurrentProgress());
 
     if (mounted) {
       setState(() => _controller = controller);
@@ -954,6 +1312,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     if (c == null || !c.value.isInitialized) return;
     final ep = widget.episodes[_currentIndex];
     final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('last_watched_path', ep.file.path);
     await prefs.setInt('pos_${ep.file.path}', c.value.position.inMilliseconds);
     await prefs.setInt('dur_${ep.file.path}', c.value.duration.inMilliseconds);
   }
@@ -1001,14 +1360,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
   }
 
-  void _setVideoScale(double scale) {
-    final clamped = scale.clamp(0.5, 3.5);
-    setState(() {
-      _videoScale = clamped;
-      _transformController.value = Matrix4.identity()..scale(clamped);
-    });
-  }
-
   @override
   void dispose() {
     _saveCurrentProgress();
@@ -1016,7 +1367,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _saveTimer?.cancel();
     _badgeTimer?.cancel();
     _controller?.dispose();
-    _transformController.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
@@ -1059,17 +1409,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               }
             },
             onHorizontalDragStart: (details) {
-              if (c == null || !c.value.isInitialized || _videoScale > 1.02) return;
+              if (c == null || !c.value.isInitialized) return;
               setState(() {
                 _isScrubbing = true;
-                _scrubStartPos = c.value.position;
                 _scrubTargetPos = c.value.position;
               });
             },
             onHorizontalDragUpdate: (details) {
               if (!_isScrubbing || c == null) return;
               final ratio = details.delta.dx / screenWidth;
-              // Полный свайп через экран перематывает на 90 секунд
               final deltaMs = (ratio * 90000).round();
               var next = _scrubTargetPos + Duration(milliseconds: deltaMs);
               if (next < Duration.zero) next = Duration.zero;
@@ -1084,23 +1432,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             child: Stack(
               alignment: Alignment.center,
               children: [
+                // Видео без масштабирования и зум-полосок
                 if (c != null && c.value.isInitialized)
-                  InteractiveViewer(
-                    transformationController: _transformController,
-                    minScale: 0.5,
-                    maxScale: 3.5,
-                    panEnabled: _videoScale > 1.02,
-                    onInteractionUpdate: (_) {
-                      final scale = _transformController.value.getMaxScaleOnAxis();
-                      if ((scale - _videoScale).abs() > 0.01) {
-                        setState(() => _videoScale = scale);
-                      }
-                    },
-                    child: Center(
-                      child: AspectRatio(
-                        aspectRatio: c.value.aspectRatio,
-                        child: VideoPlayer(c),
-                      ),
+                  Center(
+                    child: AspectRatio(
+                      aspectRatio: c.value.aspectRatio,
+                      child: VideoPlayer(c),
                     ),
                   )
                 else
@@ -1183,14 +1520,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                       ],
                                     ),
                                   ),
-                                  TextButton.icon(
-                                    onPressed: () => _setVideoScale(_videoScale == 1.0 ? 1.35 : 1.0),
-                                    icon: const Icon(Icons.aspect_ratio, color: Colors.white, size: 20),
-                                    label: Text(
-                                      '${(_videoScale * 100).round()}%',
-                                      style: const TextStyle(color: Colors.white),
-                                    ),
-                                  ),
                                   IconButton(
                                     tooltip: 'Повернуть экран принудительно',
                                     icon: const Icon(Icons.screen_rotation, color: Colors.white),
@@ -1200,14 +1529,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                               ),
                             ),
 
-                            // Центральные кнопки (изолированное переключение серий внутри мульта)
+                            // Центральные кнопки переключения серий внутри мульта
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 IconButton(
                                   iconSize: 40,
                                   tooltip: 'Предыдущая серия этого мульта',
-                                  onPressed: hasPrev ? () => _initEpisode(_currentIndex - 1) : null,
+                                  onPressed:
+                                      hasPrev ? () => _initEpisode(_currentIndex - 1) : null,
                                   icon: Icon(
                                     Icons.skip_previous_rounded,
                                     color: hasPrev ? Colors.white : Colors.white24,
@@ -1232,7 +1562,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                 IconButton(
                                   iconSize: 40,
                                   tooltip: 'Следующая серия этого мульта',
-                                  onPressed: hasNext ? () => _initEpisode(_currentIndex + 1) : null,
+                                  onPressed:
+                                      hasNext ? () => _initEpisode(_currentIndex + 1) : null,
                                   icon: Icon(
                                     Icons.skip_next_rounded,
                                     color: hasNext ? Colors.white : Colors.white24,
@@ -1241,56 +1572,35 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                               ],
                             ),
 
-                            // Нижняя шкала времени и зум-ползунок
+                            // Нижняя шкала времени (без полоски масштаба)
                             if (c != null && c.value.isInitialized)
                               Padding(
                                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                                child: Column(
+                                child: Row(
                                   children: [
-                                    Row(
-                                      children: [
-                                        const Icon(Icons.zoom_in, size: 18, color: Colors.white70),
-                                        Expanded(
-                                          child: Slider(
-                                            value: _videoScale,
-                                            min: 0.5,
-                                            max: 3.5,
-                                            activeColor: const Color(0xFF00D2FF),
-                                            onChanged: (v) {
-                                              _setVideoScale(v);
-                                              _restartHideTimer();
-                                            },
-                                          ),
-                                        ),
-                                      ],
+                                    Text(
+                                      formatDuration(c.value.position),
+                                      style: const TextStyle(fontSize: 12),
                                     ),
-                                    Row(
-                                      children: [
-                                        Text(
-                                          formatDuration(c.value.position),
-                                          style: const TextStyle(fontSize: 12),
-                                        ),
-                                        Expanded(
-                                          child: Slider(
-                                            value: c.value.position.inMilliseconds
-                                                .clamp(0, c.value.duration.inMilliseconds)
-                                                .toDouble(),
-                                            min: 0,
-                                            max: c.value.duration.inMilliseconds
-                                                .toDouble()
-                                                .clamp(1, double.infinity),
-                                            activeColor: const Color(0xFF6C63FF),
-                                            onChanged: (v) {
-                                              c.seekTo(Duration(milliseconds: v.round()));
-                                              _restartHideTimer();
-                                            },
-                                          ),
-                                        ),
-                                        Text(
-                                          formatDuration(c.value.duration),
-                                          style: const TextStyle(fontSize: 12),
-                                        ),
-                                      ],
+                                    Expanded(
+                                      child: Slider(
+                                        value: c.value.position.inMilliseconds
+                                            .clamp(0, c.value.duration.inMilliseconds)
+                                            .toDouble(),
+                                        min: 0,
+                                        max: c.value.duration.inMilliseconds
+                                            .toDouble()
+                                            .clamp(1, double.infinity),
+                                        activeColor: const Color(0xFF6C63FF),
+                                        onChanged: (v) {
+                                          c.seekTo(Duration(milliseconds: v.round()));
+                                          _restartHideTimer();
+                                        },
+                                      ),
+                                    ),
+                                    Text(
+                                      formatDuration(c.value.duration),
+                                      style: const TextStyle(fontSize: 12),
                                     ),
                                   ],
                                 ),
